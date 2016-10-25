@@ -139,6 +139,107 @@ static DEFINE_SPINLOCK(uid_tag_data_tree_lock);
 static struct rb_root proc_qtu_data_tree = RB_ROOT;
 /* No proc_qtu_data_tree_lock; use uid_tag_data_tree_lock */
 
+#define SAVE_LAST_UID
+#ifdef SAVE_LAST_UID
+#define ROOT_UID 0
+#define SYSTEM_UID 1000
+#define MOBILE_IFACE "rmnet"
+#define MOBILE_IFACE_LEN 5
+
+static uid_t g_last_uid = 0;
+static DEFINE_SPINLOCK(update_last_uid_lock);
+
+static void clear_last_uid(uid_t uid) {
+  spin_lock_bh(&update_last_uid_lock);
+  g_last_uid = uid;
+  spin_unlock_bh(&update_last_uid_lock);
+}
+
+static bool isMobileIface(int hook_num, const char *iface) {
+  bool isMobile = false;
+
+  if(memcmp(iface, MOBILE_IFACE, MOBILE_IFACE_LEN) == 0) {
+    isMobile = true;
+  }
+
+  MT_DEBUG("qtaguid[%d] dev:%s isMobile:%d\n", hook_num, iface, isMobile);
+
+  return isMobile;
+}
+
+static void set_last_uid(uid_t uid, int protocol, int dir, int hook_num, const char *dev_name) {
+  if(uid != ROOT_UID && uid != SYSTEM_UID && isMobileIface(hook_num, dev_name)) {
+    if(protocol == IPPROTO_TCP && dir == IFS_TX) {
+      spin_lock_bh(&update_last_uid_lock);
+      if(uid != g_last_uid) {
+        g_last_uid = uid;
+      }
+      spin_unlock_bh(&update_last_uid_lock);
+      MT_DEBUG("qtaguid[%d] dev:%s set_last_uid:use last_uid:%d proto %d dir:%d\n", hook_num, dev_name,
+        uid, protocol, dir);
+    }
+  }
+}
+
+static uid_t get_last_uid(int protocol, int dir, int hook_num, const char *dev_name) {
+  uid_t uid = ROOT_UID;
+  if(protocol == IPPROTO_TCP && dir == IFS_RX && isMobileIface(hook_num, dev_name)) {
+    spin_lock_bh(&update_last_uid_lock);
+    uid = g_last_uid;
+    spin_unlock_bh(&update_last_uid_lock);
+  }
+
+  MT_DEBUG("qtaguid[%d] dev:%s get_last_uid:use last_uid:%d proto %d dir:%d\n", hook_num, dev_name,
+      uid, protocol, dir);
+  return uid;
+}
+
+/* Guarantied to return a net_device that has a name */
+static void get_dev_and_dir(const struct sk_buff *skb,
+			    struct xt_action_param *par,
+			    enum ifs_tx_rx *direction,
+			    const struct net_device **el_dev)
+{
+	const struct net_device * other_dev = NULL;
+	BUG_ON(!direction || !el_dev);
+
+	if (par->in) {
+		other_dev = par->in;
+		*direction = IFS_RX;
+	} else if (par->out) {
+		other_dev = par->out;
+		*direction = IFS_TX;
+	} else {
+		pr_err("qtaguid[%d]: %s(): no par->in/out?!!\n",
+		       par->hooknum, __func__);
+	}
+	if(!skb->dev) {
+		*el_dev = other_dev;
+	} else {
+		*el_dev = skb->dev;
+		if (other_dev && *el_dev != other_dev) {
+			MT_DEBUG("qtaguid[%d]: skb->dev=%p %s vs par->%s=%p %s\n",
+					par->hooknum, skb->dev, skb->dev->name,
+					*direction == IFS_RX ? "in" : "out",  *el_dev,
+					(*el_dev)->name);
+		}
+	}
+
+	if (unlikely(!(*el_dev))) {
+		pr_err_ratelimited("qtaguid[%d]: %s(): no dev?!!\n",
+		       par->hooknum, __func__);
+		BUG();
+	}
+
+	if (unlikely(!(*el_dev)->name)) {
+		pr_err_ratelimited("qtaguid[%d]: %s(): no dev->name?!!\n",
+		       par->hooknum, __func__);
+		BUG();
+	}
+}
+
+#endif
+
 static struct qtaguid_event_counts qtu_events;
 /*----------------------------------------------*/
 static bool can_manipulate_uids(void)
@@ -1391,6 +1492,10 @@ static int iface_netdev_event_handler(struct notifier_block *nb,
 		break;
 	case NETDEV_DOWN:
 	case NETDEV_UNREGISTER:
+#ifdef SAVE_LAST_UID
+		/* when one interface is down, clear last uid */
+		clear_last_uid(ROOT_UID);
+#endif
 		iface_stat_update(dev, event == NETDEV_DOWN);
 		atomic64_inc(&qtu_events.iface_events);
 		break;
@@ -1658,6 +1763,12 @@ static bool qtaguid_mt(const struct sk_buff *skb, struct xt_action_param *par)
 	bool got_sock = false;
 	struct sock *sk;
 	kuid_t sock_uid;
+#ifdef SAVE_LAST_UID
+	uid_t last_uid;
+	int protocol = 0;
+	enum ifs_tx_rx dir = IFS_MAX_DIRECTIONS;
+	const struct net_device *net_dev = NULL;
+#endif
 	bool res;
 	bool set_sk_callback_lock = false;
 
@@ -1738,8 +1849,17 @@ static bool qtaguid_mt(const struct sk_buff *skb, struct xt_action_param *par)
 		 * For now we only do iface stats when the uid-owner is not
 		 * requested.
 		 */
+#ifdef SAVE_LAST_UID
+		if (!(info->match & XT_QTAGUID_UID)) {
+			protocol = ipx_proto(skb, par);
+			get_dev_and_dir(skb, par, &dir, &net_dev);
+			last_uid = get_last_uid(protocol, dir, par->hooknum, net_dev->name);
+			account_for_uid(skb, sk, last_uid, par);
+		}
+#else
 		if (!(info->match & XT_QTAGUID_UID))
 			account_for_uid(skb, sk, 0, par);
+#endif
 		MT_DEBUG("qtaguid[%d]: leaving (sk?sk->sk_socket)=%p\n",
 			par->hooknum,
 			sk ? sk->sk_socket : NULL);
@@ -1753,7 +1873,14 @@ static bool qtaguid_mt(const struct sk_buff *skb, struct xt_action_param *par)
 	filp = sk->sk_socket->file;
 	if (filp == NULL) {
 		MT_DEBUG("qtaguid[%d]: leaving filp=NULL\n", par->hooknum);
+#ifdef SAVE_LAST_UID
+		protocol = ipx_proto(skb, par);
+		get_dev_and_dir(skb, par, &dir, &net_dev);
+		last_uid = get_last_uid(protocol, dir, par->hooknum, net_dev->name);
+		account_for_uid(skb, sk, last_uid, par);
+#else
 		account_for_uid(skb, sk, 0, par);
+#endif
 		res = ((info->match ^ info->invert) &
 			(XT_QTAGUID_UID | XT_QTAGUID_GID)) == 0;
 		atomic64_inc(&qtu_events.match_no_sk_file);
@@ -1764,9 +1891,18 @@ static bool qtaguid_mt(const struct sk_buff *skb, struct xt_action_param *par)
 	 * TODO: unhack how to force just accounting.
 	 * For now we only do iface stats when the uid-owner is not requested
 	 */
+#ifdef SAVE_LAST_UID
+	if (!(info->match & XT_QTAGUID_UID)) {
+		/* 0 root user, 1000 system user */
+		protocol = ipx_proto(skb, par);
+		get_dev_and_dir(skb, par, &dir, &net_dev);
+		set_last_uid(from_kuid(&init_user_ns, sock_uid), protocol, dir, par->hooknum, (const char *)net_dev->name);
+		account_for_uid(skb, sk, from_kuid(&init_user_ns, sock_uid), par);
+	}
+#else
 	if (!(info->match & XT_QTAGUID_UID))
 		account_for_uid(skb, sk, from_kuid(&init_user_ns, sock_uid), par);
-
+#endif
 	/*
 	 * The following two tests fail the match when:
 	 *    id not in range AND no inverted condition requested

@@ -295,7 +295,13 @@ void dwc3_gadget_giveback(struct dwc3_ep *dep, struct dwc3_request *req,
 
 	dbg_done(dep->number, req->request.actual, req->request.status);
 	spin_unlock(&dwc->lock);
-	usb_gadget_giveback_request(&dep->endpoint, &req->request);
+
+	/* EP possibly disabled during giveback? */
+	smp_wmb();
+	if (dep->flags & DWC3_EP_ENABLED) {
+		usb_gadget_giveback_request(&dep->endpoint, &req->request);
+	}
+
 	spin_lock(&dwc->lock);
 }
 
@@ -653,6 +659,8 @@ static int __dwc3_gadget_ep_disable(struct dwc3_ep *dep)
 	dep->comp_desc = NULL;
 	dep->type = 0;
 	dep->flags = 0;
+
+	printk("====ep:%s is disabled in %s:%d====\n",dep->name,__func__,__LINE__);
 
 	return 0;
 }
