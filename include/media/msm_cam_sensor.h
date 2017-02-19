@@ -2,7 +2,6 @@
 #define __LINUX_MSM_CAM_SENSOR_H
 
 #include <uapi/media/msm_cam_sensor.h>
-#include <uapi/media/msm_camsensor_sdk.h>
 
 #include <linux/compat.h>
 
@@ -73,12 +72,6 @@ struct csid_cfg_data32 {
 	} cfg;
 };
 
-struct msm_ir_led_cfg_data_t32 {
-	enum msm_ir_led_cfg_type_t cfg_type;
-	int32_t pwm_duty_on_ns;
-	int32_t pwm_period_ns;
-};
-
 struct eeprom_read_t32 {
 	compat_uptr_t dbuffer;
 	uint32_t num_bytes;
@@ -113,7 +106,6 @@ struct msm_camera_i2c_seq_reg_setting32 {
 	enum msm_camera_i2c_reg_addr_type addr_type;
 	uint16_t delay;
 };
-#endif
 
 struct msm_camera_i2c_reg_setting32 {
 	compat_uptr_t reg_setting;
@@ -266,7 +258,7 @@ struct msm_flash_cfg_data_t32 {
 
 #define VIDIOC_MSM_FLASH_CFG32 \
 	_IOWR('V', BASE_VIDIOC_PRIVATE + 13, struct msm_flash_cfg_data_t32)
-
-#define VIDIOC_MSM_IR_LED_CFG32 \
-	_IOWR('V', BASE_VIDIOC_PRIVATE + 14, struct msm_ir_led_cfg_data_t32)
 #endif
+
+#endif
+
